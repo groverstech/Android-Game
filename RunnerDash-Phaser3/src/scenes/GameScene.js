@@ -1,20 +1,41 @@
 import Phaser from 'phaser';
 
-function playBeep(scene, freq=880, dur=0.08, type='square', volume=0.1){
+function playBeep(scene, freq = 880, dur = 0.08, type = 'square', volume = 0.1) {
   try {
     const ac = scene.sound.context;
-    const osc = ac.createOscillator(); const gain = ac.createGain();
-    osc.type = type; osc.frequency.value = freq; gain.gain.value = volume;
-    osc.connect(gain); gain.connect(ac.destination);
-    osc.start();
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+
+    osc.type = type;
+    osc.frequency.value = freq;
+
+    // Start volume
+    gain.gain.setValueAtTime(volume, ac.currentTime);
+    // Smooth fade out to 0
+    gain.gain.linearRampToValueAtTime(0, ac.currentTime + dur);
+
+    osc.connect(gain);
+    gain.connect(ac.destination);
+
+    osc.start(ac.currentTime);
     osc.stop(ac.currentTime + dur);
-  } catch(e){}
+
+    // Clean up nodes when finished
+    osc.onended = () => {
+      osc.disconnect();
+      gain.disconnect();
+    };
+  } catch (e) {
+    console.warn('playBeep error', e);
+  }
 }
 
 export default class GameScene extends Phaser.Scene {
-  constructor(){ super('Game'); }
+  constructor() {
+    super('Game');
+  }
 
-  init(){
+  init() {
     this.state = {
       score: 0,
       distance: 0,
@@ -23,34 +44,29 @@ export default class GameScene extends Phaser.Scene {
       shield: 0,
       magnet: 0,
       speedBoost: 0,
-      paused: false
+      paused: false,
+      gameOver: false,
     };
   }
 
-  create(){
+  create() {
     const { width, height } = this.scale;
 
     // Background
-    this.sky = this.add.tileSprite(0,0,width,height,'sky',0).setOrigin(0).setScrollFactor(0);
+    this.sky = this.add.tileSprite(0, 0, width, height, 'sky').setOrigin(0).setScrollFactor(0);
 
-    // Ground physics group via tiles
+    // Ground
     this.ground = this.physics.add.staticGroup();
-    const tileH = 64; const tiles = Math.ceil(width/64)+2;
-    for(let i=0;i<tiles;i++){
-      const tile = this.ground.create(i*64, height-32, 'ground', 0).setOrigin(0,0.5);
+    const tiles = Math.ceil(width / 64) + 2;
+    for (let i = 0; i < tiles; i++) {
+      const tile = this.ground.create(i * 64, height - 32, 'ground').setOrigin(0, 0.5);
       tile.refreshBody();
     }
 
     // Player
-    this.player = this.physics.add.sprite(160, height-140, 'player_run_0', 0).setDepth(2);
+    this.player = this.physics.add.sprite(160, height - 140, 'player_run_0').setDepth(2);
     this.player.setCollideWorldBounds(true);
-    this.player.body.setSize(40,60).setOffset(4,8);
-
-    // Animations
-    for(let i=0;i<3;i++){
-      this.anims.create({ key: 'run'+i, frames: [{key:'player_run_'+i, frame:0}], frameRate: 8, repeat: -1 });
-    }
-    this.player.play('run0');
+    this.player.body.setSize(40, 60).setOffset(4, 8);
 
     // Groups
     this.obstacles = this.physics.add.group();
@@ -65,151 +81,152 @@ export default class GameScene extends Phaser.Scene {
 
     // Controls
     this.cursors = this.input.keyboard.createCursorKeys();
-    this.input.keyboard.on('keydown-P', ()=> this.togglePause());
-    this.input.on('pointerdown', ()=> this.jump());
+    this.input.keyboard.on('keydown-P', () => this.togglePause());
+    this.input.on('pointerdown', () => this.jump());
 
     // Spawners
-    this.time.addEvent({ delay: 900, loop: true, callback: ()=> this.spawnObstacle() });
-    this.time.addEvent({ delay: 400, loop: true, callback: ()=> this.maybeSpawnCoin() });
-    this.time.addEvent({ delay: 4500, loop: true, callback: ()=> this.maybeSpawnPower() });
+    this.time.addEvent({ delay: 900, loop: true, callback: () => this.spawnObstacle() });
+    this.time.addEvent({ delay: 400, loop: true, callback: () => this.maybeSpawnCoin() });
+    this.time.addEvent({ delay: 4500, loop: true, callback: () => this.maybeSpawnPower() });
 
-    // Difficulty ramp
     this.baseSpeed = 340;
     this.speed = this.baseSpeed;
   }
 
-  update(time, delta){
-    if(this.state.paused) return;
+  update(time, delta) {
+    if (this.state.paused || this.state.gameOver) return;
 
-    const dt = delta/1000;
-    const { width, height } = this.scale;
+    const dt = delta / 1000;
 
-    // Parallax
-    const skySpeed = (this.speed/8) * dt;
-    this.sky.tilePositionX += skySpeed;
+    // Background parallax
+    this.sky.tilePositionX += (this.speed / 8) * dt;
 
-    // Animate player faux-run: swap among the 3 textures
-    if(this.player.body.onFloor()){
-      const frame = Math.floor(time/120) % 3;
-      this.player.setTexture('player_run_'+frame, 0);
+    // Fake run animation
+    if (this.player.body.onFloor()) {
+      const frame = Math.floor(time / 120) % 3;
+      this.player.setTexture('player_run_' + frame);
     }
 
-    // Increase difficulty slowly
-    this.speed = this.baseSpeed + Math.min(520, (this.state.distance/12));
+    // Increase difficulty with distance
+    this.speed = this.baseSpeed + Math.min(520, this.state.distance / 12);
 
-    if(this.state.speedBoost > 0){
+    if (this.state.speedBoost > 0) {
       this.state.speedBoost -= dt;
       this.speed *= 1.35;
-      if(this.state.speedBoost <= 0){ this.state.speedBoost = 0; }
     }
 
-    // Move obstacles/coins/powerups
-    [...this.obstacles.getChildren(), ...this.coins.getChildren(), ...this.powerups.getChildren()].forEach(obj=>{
+    // Move objects
+    [...this.obstacles.getChildren(), ...this.coins.getChildren(), ...this.powerups.getChildren()].forEach((obj) => {
       obj.x -= this.speed * dt;
-      if(obj.x < -100){ obj.destroy(); }
+      if (obj.x < -100) obj.destroy();
     });
 
     // Distance & score
-    this.state.distance += (this.speed * dt) / 16; // arbitrary scaling
-    this.state.score += dt * 10 + (this.state.magnet > 0 ? 2*dt : 0);
+    this.state.distance += (this.speed * dt) / 16;
+    this.state.score += dt * 10 + (this.state.magnet > 0 ? 2 * dt : 0);
 
-    if(this.state.magnet > 0){
+    // Magnet effect
+    if (this.state.magnet > 0) {
       this.state.magnet -= dt;
-      // Pull coins
-      this.coins.getChildren().forEach(c=>{
-        const dx = this.player.x - c.x, dy = this.player.y - c.y;
-        const d = Math.hypot(dx,dy);
-        if(d < 240){
-          c.body.velocity.x = (dx/d) * 600;
-          c.body.velocity.y = (dy/d) * 600;
+      this.coins.getChildren().forEach((c) => {
+        const dx = this.player.x - c.x,
+          dy = this.player.y - c.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 240) {
+          c.body.velocity.x = (dx / d) * 600;
+          c.body.velocity.y = (dy / d) * 600;
         }
       });
     }
 
-    if(this.state.shield > 0){
+    // Shield effect
+    if (this.state.shield > 0) {
       this.state.shield -= dt;
-      if(!this.shieldFX || !this.shieldFX.active){
-        this.shieldFX = this.add.image(this.player.x, this.player.y, 'shield', 0).setDepth(1.5);
+      if (!this.shieldFX) {
+        this.shieldFX = this.add.image(this.player.x, this.player.y, 'shield').setDepth(1.5);
       }
       this.shieldFX.setPosition(this.player.x, this.player.y);
-      this.shieldFX.setScale(1 + 0.05*Math.sin(time/120));
+      this.shieldFX.setScale(1 + 0.05 * Math.sin(time / 120));
       this.shieldFX.setAlpha(0.6);
-      if(this.state.shield <= 0 && this.shieldFX){ this.shieldFX.destroy(); this.shieldFX = null; }
+      if (this.state.shield <= 0) {
+        this.shieldFX.destroy();
+        this.shieldFX = null;
+      }
     }
 
-    // Auto-spawn ground tiles if camera moves (static here but left for extensibility)
-
-    // UI events
+    // Update HUD
     this.events.emit('hud:update', { ...this.state });
   }
 
-  jump(){
-    if(this.state.paused) return;
-    const onFloor = this.player.body.onFloor();
-    if(onFloor){
+  jump() {
+    if (this.state.paused || this.state.gameOver) return;
+    if (this.player.body.onFloor()) {
       this.player.setVelocityY(-760);
-      this.player.setTexture('player_jump', 0);
+      this.player.setTexture('player_jump');
       playBeep(this, 660, 0.05, 'triangle', 0.15);
       this.player.doubleJump = true;
-    } else if(this.player.doubleJump){
+    } else if (this.player.doubleJump) {
       this.player.setVelocityY(-680);
       this.player.doubleJump = false;
       playBeep(this, 520, 0.05, 'sawtooth', 0.15);
     }
   }
 
-  spawnObstacle(){
-    if(this.state.paused) return;
+  spawnObstacle() {
+    if (this.state.paused || this.state.gameOver) return;
     const { width, height } = this.scale;
-    const o = this.obstacles.create(width+48, height-96, 'spike', 0);
+
+    // Variation in spike distance
+    const gap = Phaser.Math.Between(0, 1) ? 0 : Phaser.Math.Between(64, 160);
+
+    const o = this.obstacles.create(width + 48 + gap, height - 96, 'spike');
     o.setImmovable(true);
     o.body.setAllowGravity(false);
-    o.body.setSize(44,28).setOffset(2,4);
+    o.body.setSize(44, 28).setOffset(2, 4);
   }
 
-  maybeSpawnCoin(){
-    if(this.state.paused) return;
+  maybeSpawnCoin() {
+    if (this.state.paused || this.state.gameOver) return;
     const { width, height } = this.scale;
-    if(Math.random() < 0.8){
-      const coins = Phaser.Math.Between(3,6);
+    if (Math.random() < 0.8) {
+      const coins = Phaser.Math.Between(3, 6);
       const startY = height - Phaser.Math.Between(180, 280);
-      for(let i=0;i<coins;i++){
-        const c = this.coins.create(width+ i*36, startY + Phaser.Math.Between(-20,20), 'coin',0);
+      for (let i = 0; i < coins; i++) {
+        const c = this.coins.create(width + i * 36, startY + Phaser.Math.Between(-20, 20), 'coin');
         c.body.setAllowGravity(false);
         c.body.setCircle(14, 2, 2);
       }
     }
   }
 
-  maybeSpawnPower(){
-    if(this.state.paused) return;
+  maybeSpawnPower() {
+    if (this.state.paused || this.state.gameOver) return;
     const r = Math.random();
     const { width, height } = this.scale;
-    let key = null;
-    if(r < 0.34) key = 'shield'; else if(r < 0.67) key = 'magnet'; else key = 'speed';
-    const p = this.powerups.create(width+50, height-Phaser.Math.Between(180,300), key, 0);
+    let key = r < 0.34 ? 'shield' : r < 0.67 ? 'magnet' : 'speed';
+    const p = this.powerups.create(width + 50, height - Phaser.Math.Between(180, 300), key);
     p.body.setAllowGravity(false);
     p.setData('kind', key);
   }
 
-  collectCoin(player, coin){
+  collectCoin(player, coin) {
     coin.destroy();
     this.state.coins += 1;
     this.state.score += 5;
     playBeep(this, 1200, 0.03, 'square', 0.12);
   }
 
-  takePower(player, p){
+  takePower(player, p) {
     const kind = p.getData('kind');
     p.destroy();
-    if(kind === 'shield') this.state.shield = 6;
-    if(kind === 'magnet') this.state.magnet = 8;
-    if(kind === 'speed') this.state.speedBoost = 4;
+    if (kind === 'shield') this.state.shield = 6;
+    if (kind === 'magnet') this.state.magnet = 8;
+    if (kind === 'speed') this.state.speedBoost = 4;
     playBeep(this, 300, 0.08, 'sine', 0.18);
   }
 
-  hitObstacle(player, obstacle){
-    if(this.state.shield > 0){
+  hitObstacle(player, obstacle) {
+    if (this.state.shield > 0) {
       obstacle.destroy();
       playBeep(this, 200, 0.06, 'triangle', 0.18);
       return;
@@ -217,20 +234,31 @@ export default class GameScene extends Phaser.Scene {
     this.gameOver();
   }
 
-  gameOver(){
-    playBeep(this, 110, 0.15, 'sawtooth', 0.2);
+  gameOver() {
+    // 2-second sawtooth buzz with fade-out
+    playBeep(this, 80, 0.5, 'sine', 0.25);
+
     this.state.paused = true;
+    this.state.gameOver = true;
+
     this.player.setTint(0xff6b6b);
-    this.player.setVelocity(0,0);
+    this.player.setVelocity(0, 0);
+
     this.state.best = Math.max(this.state.best, Math.floor(this.state.score));
     localStorage.setItem('rdash_best', String(this.state.best));
-    this.time.delayedCall(600, ()=>{
-      this.scene.restart();
-      this.scene.get('UI').events.emit('hud:flash', { text: 'Tap/Space to Restart!' });
+
+    this.scene.get('UI').events.emit('hud:flash', {
+      text: 'GAME OVER - Tap/Space to Restart!',
     });
+
+    // Restart on input
+    this.input.once('pointerdown', () => this.scene.restart());
+    this.input.keyboard.once('keydown-SPACE', () => this.scene.restart());
+    this.input.keyboard.once('keydown-UP', () => this.scene.restart());
   }
 
-  togglePause(){
+  togglePause() {
+    if (this.state.gameOver) return;
     this.state.paused = !this.state.paused;
     this.events.emit('hud:pause', this.state.paused);
   }
